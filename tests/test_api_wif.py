@@ -311,12 +311,164 @@ def test_wif_export_tolerates_name_without_extra_sections():
               "extra-declaration import preserves cyclic/max_float")
 
 
+def test_wif_special_name_roundtrip_is_lossless():
+    from app import wif as wif_mod
+
+    with TestClient(app) as client:
+        special_names = [
+            "plain 2/2 twill",          # 普通名称：无标记、原样导出
+            " leading space",          # 首空格
+            "trailing space ",         # 尾空格
+            " both ends ",             # 首尾空格
+            "cr\rand\nlf",             # CR/LF
+            "crlf\r\nsecond line",     # CRLF
+            "uni line sep end",  # Unicode 行分隔符 U+2028
+            "para sep x",      # Unicode 段分隔符 U+2029
+            "nel\x85sep",              # NEL U+0085
+            "back\\slash path",        # 反斜杠
+            "混合\r\n名称 尾 ",  # 多字节 + 行分隔 + 首尾空格
+            ":WIFNAME-1:spoof",        # 名称本身长得像标记前缀
+        ]
+        for special_name in special_names:
+            payload = {**TWILL, "name": special_name}
+            created = client.post("/designs", json=payload).json()
+            check(created["name"] == special_name,
+                  f"JSON API stores name verbatim: {special_name!r}")
+            exported = client.get(f"/designs/{created['id']}/wif").text
+
+            # 含特殊字符时必须使用可逆标记；普通名称保持无标记旧形式
+            name_line = next(
+                ln for ln in exported.splitlines() if ln.startswith("Name=")
+            )
+            needs_mark = wif_mod._needs_encoding(special_name)
+            check(name_line.startswith("Name=:WIFNAME-1:") == needs_mark,
+                  f"export uses marker iff name is special: {special_name!r}")
+            for separator in ("\r", "\n", " ", " ", "\x85"):
+                check(separator not in name_line,
+                      f"Name line contains no raw line separators: {special_name!r}")
+
+            # 导出再导入：名称逐字节还原，交织矩阵与审计不变
+            reimp = client.post(
+                "/designs/import-wif",
+                content=exported,
+                headers={"Content-Type": "text/plain"},
+            )
+            check(reimp.status_code == 201,
+                  f"special-name WIF imports 201 ({special_name!r}): {reimp.text}")
+            reimp_data = reimp.json()
+            check(reimp_data["name"] == special_name,
+                  f"round-trip preserves special name {special_name!r}")
+            check(reimp_data["audit"] == created["audit"],
+                  f"round-trip audit unchanged for {special_name!r}")
+            check(reimp_data["threading"] == created["threading"]
+                  and reimp_data["tie_up"] == created["tie_up"]
+                  and reimp_data["treadling"] == created["treadling"],
+                  f"round-trip draft unchanged for {special_name!r}")
+
+            # 再导出一次必须字节一致（编码稳定）
+            reexported = client.get(f"/designs/{reimp_data['id']}/wif").text
+            check(reexported == exported,
+                  f"repeated export is byte-identical for {special_name!r}")
+
+
+def test_wif_import_rejects_corrupt_name_marker_without_writing():
+    with TestClient(app) as client:
+        original_id = client.post("/designs", json=TWILL).json()["id"]
+        good_export = client.get(f"/designs/{original_id}/wif").text
+
+        # 构造一份带合法标记名称的 WIF 作为破坏基线
+        marked_payload = {**TWILL, "name": "line1\r\nline2"}
+        marked_id = client.post("/designs", json=marked_payload).json()["id"]
+        marked_wif = client.get(f"/designs/{marked_id}/wif").text
+        name_line = next(ln for ln in marked_wif.splitlines()
+                         if ln.startswith("Name="))
+        check(name_line.startswith("Name=:WIFNAME-1:"),
+              "baseline WIF uses a name encoding marker")
+
+        # 多字节（中文）标记名称：翻转载荷中段字符可稳定制造非法 UTF-8
+        wide_id = client.post(
+            "/designs", json={**TWILL, "name": "混合\r\n名称"}
+        ).json()["id"]
+        wide_wif = client.get(f"/designs/{wide_id}/wif").text
+        wide_line = next(ln for ln in wide_wif.splitlines()
+                         if ln.startswith("Name="))
+        wide_payload = wide_line[len("Name=:WIFNAME-1:"):]
+
+        ids_before = {d["id"] for d in client.get("/designs").json()}
+
+        def reject(body, msg):
+            nonlocal ids_before
+            resp = client.post("/designs/import-wif", content=body)
+            check(resp.status_code == 400, f"{msg}: 400")
+            ids_after = {d["id"] for d in client.get("/designs").json()}
+            check(ids_after == ids_before, f"{msg}: no design written")
+            ids_before = ids_after
+
+        # base64 字符表外的损坏
+        reject(marked_wif.replace(name_line, "Name=:WIFNAME-1:!!!"),
+               "non-base64 marker payload rejected")
+        # 形似标记但载荷截断
+        reject(marked_wif.replace(name_line, "Name=:WIFNAME-1:"),
+               "empty marker payload rejected")
+        # 合法字符但无法解码 / 非规范编码（AAAA 解码后再编码不一致）
+        reject(marked_wif.replace(name_line, "Name=:WIFNAME-1:AAAA"),
+               "non-canonical marker payload rejected")
+        # 等号出现在载荷中间：base64 非法填充
+        payload = name_line[len("Name=:WIFNAME-1:"):]
+        reject(
+            marked_wif.replace(
+                name_line,
+                f"Name=:WIFNAME-1:{payload[:3]}={payload[4:]}",
+            ),
+            "embedded padding in marker payload rejected",
+        )
+        # 多字节（中文）名称：翻转载荷中段一个字符 → 非法 UTF-8 续字节
+        mid = len(wide_payload) // 2
+        tampered = wide_payload[:mid] + ("A" if wide_payload[mid] != "A" else "B") \
+            + wide_payload[mid + 1:]
+        reject(wide_wif.replace(wide_line, f"Name=:WIFNAME-1:{tampered}"),
+               "tampered multibyte marker payload rejected")
+
+        # 标记损坏的拒绝不影响其它正常导入
+        ok = client.post(
+            "/designs/import-wif",
+            content=good_export,
+            headers={"Content-Type": "text/plain"},
+        )
+        check(ok.status_code == 201, "normal WIF still imports after corrupt ones")
+
+
+def test_wif_import_legacy_unmarked_name_still_supported():
+    with TestClient(app) as client:
+        # 旧版导出：Name 为无标记单行文本（含 CR/LF 被替换成空格的旧风格）
+        legacy = EXPECTED_WIF.replace("Name=2/2 twill", "Name=  legacy 2/2 twill  ")
+        resp = client.post("/designs/import-wif", content=legacy)
+        check(resp.status_code == 201, f"legacy unmarked name imports: {resp.text}")
+        check(resp.json()["name"] == "legacy 2/2 twill",
+              "legacy unmarked Name trimmed on import")
+
+        # 无标记缺省 / 空 Name 仍为 null
+        empty = EXPECTED_WIF.replace("Name=2/2 twill", "Name=")
+        resp2 = client.post("/designs/import-wif", content=empty)
+        check(resp2.status_code == 201 and resp2.json()["name"] is None,
+              "legacy empty Name stays null")
+
+        # 无标记但含反斜杠的旧文本：按明文导入（反斜杠不产生特殊语义）
+        slash = EXPECTED_WIF.replace("Name=2/2 twill", "Name=C:\\draft\\x")
+        resp3 = client.post("/designs/import-wif", content=slash)
+        check(resp3.status_code == 201 and resp3.json()["name"] == "C:\\draft\\x",
+              "legacy unmarked backslash name imports as literal text")
+
+
 if __name__ == "__main__":
     test_wif_export()
     test_wif_roundtrip_preserves_matrix_and_audit()
     test_wif_import_non_cyclic_defaults_and_explicit_no()
     test_wif_import_rejects_malformed_without_writing()
     test_wif_export_tolerates_name_without_extra_sections()
+    test_wif_special_name_roundtrip_is_lossless()
+    test_wif_import_rejects_corrupt_name_marker_without_writing()
+    test_wif_import_legacy_unmarked_name_still_supported()
     try:
         os.unlink(_TMP_DB.name)
     except OSError:

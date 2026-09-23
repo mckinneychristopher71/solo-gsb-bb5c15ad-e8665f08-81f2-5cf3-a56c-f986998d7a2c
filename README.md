@@ -941,6 +941,7 @@ MAX_FLOAT=2
 | 段落 / 键 | 说明 |
 | --- | --- |
 | `[WIF] Version` | 必须为 `1.1`；`Name` 可缺省或为空（导入为空名称 `null`） |
+| `[WIF] Name` | 设计名，单行文本；含 CR/LF、Unicode 行分隔符（`U+2028`/`U+2029` 等）、反斜杠或首尾空白等特殊名称以可逆标记 `:WIFNAME-1:<urlsafe-base64>` 导出（见下） |
 | `[CONTENTS]` | 必须逐一声明 `TEXTPLAN/TIEUP/THREADING/TREADLING/WEAVING=yes`，且对应段落都存在；额外声明本子集不使用的段落（如 `WARP`/`WEFT`）会被忽略 |
 | `[TEXTPLAN] WARP/WEFT THREADS` | 经纱数 / 纬纱数（正整数），必须分别与 `[THREADING]`/`[TREADLING]` 条目数一致 |
 | `[TIEUP]` | 键为踏板号 `1..TREADLES`（每行恰好出现一次）；值为逗号分隔、每行 `SHAFTS` 个严格的 `0`/`1` |
@@ -949,6 +950,29 @@ MAX_FLOAT=2
 | `[WEAVING] SHAFTS/TREADLES` | 综框数 / 踏板数（正整数），必须与绑综矩阵列数 / 行数一致 |
 | `[WEAVING] CYCLIC` | 仅接受 `yes`/`no`（大小写不敏感），分别对应 JSON 的 `true`/`false` |
 | `[WEAVING] MAX_FLOAT` | 允许的最大浮长，正整数（≥ 1），语义同 JSON API |
+
+**设计名的可逆编码**：WIF 是逐行解析的纯文本，名称中的 CR/LF、Unicode
+行/段分隔符（`U+2028`、`U+2029`、`U+0085` 等 `splitlines` 行边界）会切断
+行结构。为保证任意名称（含换行、反斜杠、首尾空格）导出再导入都**逐字节
+无损**（交织矩阵与浮长审计结果不受名称影响、保持完全一致），导出与导入
+共用同一套名称编解码：
+
+- 普通单行名称：原样输出为 `Name=<文本>`；
+- 特殊名称：输出为 `Name=:WIFNAME-1:<urlsafe-base64(UTF-8 名称)>`。仅当
+  名称含任一行边界、反斜杠、首尾空白，或本身以 `:WIFNAME-1:` 开头时才加
+  标记（urlsafe base64 字母表为 `A–Z a–z 0–9 - _`，`=` 填充）；
+- 导入兼容旧版：无标记 `Name=` 文本仍按单行原文导入（剥除行内首尾空白，
+  与历史行为一致）；一旦值带有 `:WIFNAME-1:` 标记，载荷必须是合法、非空、
+  再编码严格一致的规范编码，标记损坏（非法字符、非法填充、非法 UTF-8、
+  非规范载荷等）一律返回 **400 且不写库**。
+
+```ini
+# 普通名称
+Name=2/2 twill
+
+# 名称 "a\r\nb"（CRLF）的导出形态
+Name=:WIFNAME-1:YQ0KYg==
+```
 
 `GET /designs/{id}/wif`：导出已入库设计，`200 text/plain`；设计不存在
 返回 404。`POST /designs/import-wif`：请求体直接放 WIF 文本
@@ -969,7 +993,7 @@ curl -s -X POST http://localhost:8000/designs/import-wif \
 
 解析失败（空文档、版本不为 1.1、必需段落 / 声明缺失或不一致、重复段落或
 键、尺寸不符、索引越界、误用 0 基编号、绑综值非 0/1、`CYCLIC`/`MAX_FLOAT`
-非法等）一律返回 **400 且不写库**：
+非法、`Name` 编码标记损坏等）一律返回 **400 且不写库**：
 
 ```json
 {"detail": "warp end 3 references shaft 5 out of range: valid index is [1, 4]"}
@@ -1110,7 +1134,7 @@ curl -s http://localhost:8000/design-archives/1/verify
 - 空穿综 / 空踏综 / 空绑综矩阵、`max_float < 1`；
 - WIF 导入时：版本不为 1.1、必需段落缺失 / 声明不一致、尺寸不符、
   1 基索引越界（含误用 0 基 `0`）、绑综单元非 0/1、`CYCLIC` 非
-  `yes`/`no`、请求体非合法 UTF-8 等。
+  `yes`/`no`、`Name` 可逆编码标记损坏、请求体非合法 UTF-8 等。
 
 ```json
 {"detail": "threading[3]=9 out of range: valid shaft index is [0, 4)"}

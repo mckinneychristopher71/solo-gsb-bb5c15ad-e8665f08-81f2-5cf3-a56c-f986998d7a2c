@@ -6,7 +6,18 @@
 
     [WIF]
     Version=1.1
-    Name=<设计名，可空>
+    Name=<设计名，可空；特殊名称为 :WIFNAME-1:<base64> 标记>
+
+设计名编解码（导出与导入共用，保证无损往返）：
+
+- 普通单行名称原样输出为 ``Name=<文本>``（旧版无标记 WIF 仍可导入，
+  导入时剥除行内首尾空白）；
+- 名称含 CR/LF 或其他 ``splitlines`` 行边界（NEL ``U+0085``、
+  Unicode 行分隔符 ``U+2028``、段分隔符 ``U+2029`` 等）、反斜杠，或
+  带有首尾空白时，导出为可逆标记
+  ``Name=:WIFNAME-1:<urlsafe-base64(UTF-8 名称)>``；
+- 导入时标记必须完整可逆（合法 base64、非空、再编码严格一致），任何
+  损坏都抛 WifError → HTTP 400 且不写库。
 
     [CONTENTS]
     TEXTPLAN=yes
@@ -41,6 +52,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import re
 
 from .weave import DesignError
@@ -53,6 +66,65 @@ _REQUIRED_SECTIONS = ("TEXTPLAN", "TIEUP", "THREADING", "TREADLING", "WEAVING")
 
 class WifError(DesignError):
     """WIF 文本解析或校验失败，整份导入应被拒绝（HTTP 400）。"""
+
+
+# 特殊设计名的可逆编码标记：Name=<前缀><urlsafe-base64 载荷>。旧版无标记的
+# Name= 文本仍按「剥除行内首尾空白的单行原文」导入；一旦出现标记，载荷必须
+# 完整合法，否则视为数据损坏（WifError → 400 且不入库）。
+_NAME_MARK_PREFIX = ":WIFNAME-1:"
+_NAME_MARK_RE = re.compile(r"^" + re.escape(_NAME_MARK_PREFIX) + r"([A-Za-z0-9_-]+=*)$")
+
+# Python str.splitlines 认可的全部行边界（CR/LF、NEL、Unicode 行/段分隔符、
+# 老式换码符等）；它们若原样出现在 Name 值中会被逐行解析切断，必须编码。
+_LINE_SEPARATORS = frozenset("\n\v\f\r\x1c\x1d\x1e\x85  ")
+
+
+def _needs_encoding(name: str) -> bool:
+    """名称是否必须走标记编码：含任一行边界（会破坏逐行解析）、反斜杠
+    （保留为转义专用字符），或首尾带有会被解析端 strip 掉的空白。以标记
+    前缀开头的名称也强制编码，避免与标记文本混淆。"""
+    if name.startswith(_NAME_MARK_PREFIX):
+        return True
+    if "\\" in name:
+        return True
+    if any(ch in _LINE_SEPARATORS for ch in name):
+        return True
+    return name != name.strip()
+
+
+def _encode_name(name: str | None) -> str:
+    """把设计名编码为 WIF 单行 Name= 值：普通名称原样输出（与旧版兼容）；
+    含行边界、反斜杠或首尾空白等特殊名称用可逆标记封装，保证导出再导入
+    逐字节还原。"""
+    if not name:
+        return ""
+    name = str(name)
+    if not _needs_encoding(name):
+        return name
+    payload = base64.urlsafe_b64encode(name.encode("utf-8")).decode("ascii")
+    return _NAME_MARK_PREFIX + payload
+
+
+def _decode_name(raw: str) -> str | None:
+    """解析 Name= 值：标记文本必须完整可逆（校验失败抛 WifError，整份导入
+    400 且不入库）；无标记旧版文本沿用「剥除行内首尾空白」的宽容规则，
+    剥净或缺省均视为无名称（None）。"""
+    match = _NAME_MARK_RE.match(raw)
+    if match is None:
+        # 以标记前缀开头但整体不匹配合法标记形状：必属损坏，不按明文放行
+        if raw.startswith(_NAME_MARK_PREFIX):
+            raise WifError("[WIF] Name carries an encoding marker but is malformed")
+        return raw.strip() or None
+    payload = match.group(1)
+    try:
+        decoded_bytes = base64.b64decode(payload, altchars=b"-_", validate=True)
+        name = decoded_bytes.decode("utf-8")
+    except (binascii.Error, ValueError, UnicodeDecodeError) as exc:
+        raise WifError("[WIF] Name encoding marker is corrupted") from exc
+    # 非空名称才会被标记编码；再编码必须严格复现，拒绝任何规范化偏差
+    if not name or _encode_name(name) != raw:
+        raise WifError("[WIF] Name encoding marker is corrupted")
+    return name
 
 
 # 键的允许字符：字母、数字、空格（如 "WARP THREADS"）
@@ -117,7 +189,7 @@ def parse_wif(text: str) -> dict:
         raise WifError("[WIF] missing Version")
     if version != WIF_VERSION:
         raise WifError(f"unsupported WIF version {version!r}: only {WIF_VERSION} is supported")
-    name = header.get("NAME", "").strip() or None
+    name = _decode_name(header.get("NAME", ""))
 
     # ---- [CONTENTS]：必须逐一声明 TEXTPLAN/TIEUP/THREADING/TREADLING/WEAVING ----
     contents = sections.get("CONTENTS")
@@ -260,13 +332,6 @@ def _parse_index_map(
     return [values[i] for i in range(1, count + 1)]
 
 
-def _escape_name(name: str | None) -> str:
-    """设计名压成单行：CR/LF 会破坏逐行解析，统一替换为空格。"""
-    if not name:
-        return ""
-    return str(name).replace("\r", " ").replace("\n", " ").strip()
-
-
 def serialize_wif(
     *,
     name: str | None,
@@ -282,7 +347,7 @@ def serialize_wif(
     lines: list[str] = [
         "[WIF]",
         f"Version={WIF_VERSION}",
-        f"Name={_escape_name(name)}",
+        f"Name={_encode_name(name)}",
         "",
         "[CONTENTS]",
         "TEXTPLAN=yes",
