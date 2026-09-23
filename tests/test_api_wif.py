@@ -311,12 +311,156 @@ def test_wif_export_tolerates_name_without_extra_sections():
               "extra-declaration import preserves cyclic/max_float")
 
 
+def test_wif_special_name_roundtrip_is_lossless():
+    special_names = [
+        "line1\nline2",                       # LF
+        "line1\r\nline2",                     # CRLF
+        "line1\rline2",                       # CR
+        "uni space",     # Unicode 行分隔符 U+2028（旧版会切断逐行解析）
+        "uni para",      # Unicode 段分隔符 U+2029
+        "nel\x85mid",                         # NEL U+0085
+        "back\\slash",                        # 反斜杠
+        "  leading and trailing  ",           # 首尾空格
+        "\ttab-edged\t",                      # 首尾制表符
+        "\n",                                 # 纯行分隔符（非空名称）
+        " ",                                  # 单空格名称
+        "　fullwidth　",                      # 全角空白在首尾
+        "mix \\\r\n  x  ",  # 大杂烩
+    ]
+    with TestClient(app) as client:
+        for special in special_names:
+            created = client.post("/designs", json={**TWILL, "name": special})
+            check(created.status_code == 201,
+                  f"create design with special name {special!r}: {created.text}")
+            design_id = created.json()["id"]
+            exported = client.get(f"/designs/{design_id}/wif").text
+
+            # 导出文本必须仍是逐行可解析的结构：编码后名称不引入额外物理行
+            check(exported.startswith("[WIF]\nVersion=1.1\nName=\\B64:"),
+                  f"special name {special!r} exported with reversible marker")
+            check(exported.count("\n[CONTENTS]\n") == 1,
+                  f"special name {special!r} does not split WIF into extra lines")
+
+            resp = client.post(
+                "/designs/import-wif",
+                content=exported,
+                headers={"Content-Type": "text/plain"},
+            )
+            check(resp.status_code == 201,
+                  f"re-import exported WIF for {special!r} returns 201: {resp.text}")
+            reimported = resp.json()
+            original = created.json()
+            check(reimported["name"] == special,
+                  f"name {special!r} survives export/import unchanged, got {reimported['name']!r}")
+            check(reimported["threading"] == original["threading"]
+                  and reimported["tie_up"] == original["tie_up"]
+                  and reimported["treadling"] == original["treadling"],
+                  f"matrix unchanged for special name {special!r}")
+            check(reimported["audit"] == original["audit"],
+                  f"float audit unchanged for special name {special!r}")
+
+
+def test_wif_plain_name_export_keeps_legacy_unmarked_form():
+    with TestClient(app) as client:
+        design_id = client.post("/designs", json=TWILL).json()["id"]
+        exported = client.get(f"/designs/{design_id}/wif").text
+        check("Name=2/2 twill\n" in exported,
+              "ordinary names still export as unmarked Name= text")
+        check("\\B64:" not in exported, "ordinary names do not use encoding marker")
+
+
+def test_wif_import_legacy_unmarked_names_still_work():
+    with TestClient(app) as client:
+        # 旧版 WIF：无标记 Name=，含普通文本与内部空白
+        legacy = EXPECTED_WIF.replace("Name=2/2 twill", "Name=  legacy / draft  v2 ")
+        resp = client.post("/designs/import-wif", content=legacy)
+        check(resp.status_code == 201, f"legacy unmarked Name imports: {resp.text}")
+        check(resp.json()["name"] == "legacy / draft  v2",
+              "legacy unmarked Name parsed with strip (old behavior)")
+
+        # 无标记但含反斜杠的旧文本仍可导入（反斜杠只在标记语境下有特殊含义）
+        legacy_bs = EXPECTED_WIF.replace("Name=2/2 twill", "Name=C:\\drafts\\twill")
+        resp2 = client.post("/designs/import-wif", content=legacy_bs)
+        check(resp2.status_code == 201, f"legacy unmarked backslash name imports: {resp2.text}")
+        check(resp2.json()["name"] == "C:\\drafts\\twill",
+              "legacy unmarked backslash preserved literally")
+
+
+def test_wif_import_rejects_corrupt_encoded_names_without_writing():
+    import base64
+    import zlib
+
+    def marked(name: str) -> str:
+        data = name.encode("utf-8")
+        crc = f"{zlib.crc32(data) & 0xFFFFFFFF:08x}"
+        return "Name=\\B64:" + crc + base64.urlsafe_b64encode(data).decode("ascii")
+
+    with TestClient(app) as client:
+        # 取一份合法的标记名称导出作为篡改基础
+        created = client.post("/designs", json={**TWILL, "name": "a\nb"})
+        good = client.get(f"/designs/{created.json()['id']}/wif").text
+
+        marker_line = next(line for line in good.splitlines() if line.startswith("Name="))
+        check(marker_line.startswith("Name=\\B64:"), "fixture uses marked name")
+
+        ids_before = {d["id"] for d in client.get("/designs").json()}
+
+        def reject(body, msg):
+            nonlocal ids_before
+            resp = client.post("/designs/import-wif", content=body)
+            check(resp.status_code == 400, f"{msg}: 400, got {resp.status_code} {resp.text}")
+            ids_after = {d["id"] for d in client.get("/designs").json()}
+            check(ids_after == ids_before, f"{msg}: no design written")
+            ids_before = ids_after
+
+        # 1) 负载非 Base64 字符（CRC 段保留 8 位十六进制）
+        reject(good.replace(marker_line, "Name=\\B64:deadbeef!!!not base64!!!"),
+               "non-base64 payload rejected")
+        # 2) Base64 但错误填充 / 位垃圾
+        reject(good.replace(marker_line, "Name=\\B64:deadbeefYWJj===="),
+               "bad base64 padding rejected")
+        # 3) 合法 Base64 但解码后是非法 UTF-8 字节
+        bad_utf8 = base64.urlsafe_b64encode(b"\xff\xfe").decode("ascii")
+        reject(good.replace(marker_line, "Name=\\B64:deadbeef" + bad_utf8),
+               "base64 of invalid UTF-8 rejected")
+        # 4) 标记后为空 / 仅有 CRC 段
+        reject(good.replace(marker_line, "Name=\\B64:"),
+               "empty marked payload rejected")
+        reject(good.replace(marker_line, "Name=\\B64:deadbeef"),
+               "checksum-only marked payload rejected")
+        # 5) CRC 段不是十六进制
+        reject(good.replace(marker_line, "Name=\\B64:xxxxxxxx" + marker_line[len("Name=\\B64:") + 8:]),
+               "non-hex checksum rejected")
+        # 6) 结构合法但 CRC 与数据不符（损坏 / 截断）
+        intact = marked("a\nb")
+        check(intact == marker_line, f"fixture marker matches encoder: {intact!r} vs {marker_line!r}")
+        flipped = intact[:-1] + ("A" if not intact.endswith("A") else "B")
+        reject(good.replace(marker_line, flipped),
+               "modified payload with stale checksum rejected")
+        # 7) CRC 被改成另一个合法十六进制值
+        reject(good.replace(marker_line, "Name=\\B64:00000000" + intact[len("Name=\\B64:00000000"):]),
+               "forged checksum rejected")
+        # 8) 标记存在但名称其实不需要编码（标记被滥用 / 数据被改写）
+        plain_data = b"plain"
+        plain_line = (
+            "Name=\\B64:"
+            + f"{zlib.crc32(plain_data) & 0xFFFFFFFF:08x}"
+            + base64.urlsafe_b64encode(plain_data).decode("ascii")
+        )
+        reject(good.replace(marker_line, plain_line),
+               "marker on plain (encoding-unneeded) name rejected")
+
+
 if __name__ == "__main__":
     test_wif_export()
     test_wif_roundtrip_preserves_matrix_and_audit()
     test_wif_import_non_cyclic_defaults_and_explicit_no()
     test_wif_import_rejects_malformed_without_writing()
     test_wif_export_tolerates_name_without_extra_sections()
+    test_wif_special_name_roundtrip_is_lossless()
+    test_wif_plain_name_export_keeps_legacy_unmarked_form()
+    test_wif_import_legacy_unmarked_names_still_work()
+    test_wif_import_rejects_corrupt_encoded_names_without_writing()
     try:
         os.unlink(_TMP_DB.name)
     except OSError:

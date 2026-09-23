@@ -881,8 +881,9 @@ curl -s http://localhost:8000/designs/1/float-risk-zones
 
 服务实现一个固定段落、**1 基索引**的 WIF 1.1 纯文本子集（`text/plain;
 charset=utf-8`）。导出与导入使用同一格式，因此任意已入库设计导出后再导入，
-都会得到**完全相同的交织矩阵与审计结果**（`exceeds`、`interlacing`、
-`violations` 逐项一致），仅 `id`/`created_at` 等入库元数据不同。
+都会得到**完全相同的设计名、交织矩阵与审计结果**（`name` 逐字符一致；
+`exceeds`、`interlacing`、`violations` 逐项一致），仅 `id`/`created_at`
+等入库元数据不同。
 
 段落与键固定如下（顺序、空行与拼写均为固定形式；编号全部 1 基，
 对应 JSON API 内部的 0 基表示 ±1）：
@@ -941,6 +942,7 @@ MAX_FLOAT=2
 | 段落 / 键 | 说明 |
 | --- | --- |
 | `[WIF] Version` | 必须为 `1.1`；`Name` 可缺省或为空（导入为空名称 `null`） |
+| `[WIF] Name` | 普通名称按无标记单行文本导出 / 导入（旧规则：导入时去掉首尾空白，空值为 `null`）。名称若含 CR/LF（含 NEL、U+2028/U+2029 等全部行分隔符）、反斜杠或首尾空白，则导出为可逆的单行编码 `Name=\B64:<CRC32><urlsafe-base64(UTF-8 名称)>`（`<CRC32>` 为名称 UTF-8 字节的 8 位小写十六进制 CRC32，其余为 URL 安全 Base64），导入时校验并原样还原，含此类字符的名称可无损往返；校验和不符、负载损坏或标记滥用一律 400 且不写库 |
 | `[CONTENTS]` | 必须逐一声明 `TEXTPLAN/TIEUP/THREADING/TREADLING/WEAVING=yes`，且对应段落都存在；额外声明本子集不使用的段落（如 `WARP`/`WEFT`）会被忽略 |
 | `[TEXTPLAN] WARP/WEFT THREADS` | 经纱数 / 纬纱数（正整数），必须分别与 `[THREADING]`/`[TREADLING]` 条目数一致 |
 | `[TIEUP]` | 键为踏板号 `1..TREADLES`（每行恰好出现一次）；值为逗号分隔、每行 `SHAFTS` 个严格的 `0`/`1` |
@@ -1110,7 +1112,8 @@ curl -s http://localhost:8000/design-archives/1/verify
 - 空穿综 / 空踏综 / 空绑综矩阵、`max_float < 1`；
 - WIF 导入时：版本不为 1.1、必需段落缺失 / 声明不一致、尺寸不符、
   1 基索引越界（含误用 0 基 `0`）、绑综单元非 0/1、`CYCLIC` 非
-  `yes`/`no`、请求体非合法 UTF-8 等。
+  `yes`/`no`、请求体非合法 UTF-8、`Name` 的 `\B64:` 编码标记损坏
+  （校验和不符 / Base64 或 UTF-8 非法 / 标记被用于无需编码的名称）等。
 
 ```json
 {"detail": "threading[3]=9 out of range: valid shaft index is [0, 4)"}

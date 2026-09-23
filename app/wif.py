@@ -6,7 +6,7 @@
 
     [WIF]
     Version=1.1
-    Name=<设计名，可空>
+    Name=<设计名，可空；含行分隔符 / 反斜杠 / 首尾空白时为 \\B64: 可逆编码>
 
     [CONTENTS]
     TEXTPLAN=yes
@@ -41,7 +41,10 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import re
+import zlib
 
 from .weave import DesignError
 
@@ -49,6 +52,17 @@ WIF_VERSION = "1.1"
 WIF_CONTENT_TYPE = "text/plain; charset=utf-8"
 
 _REQUIRED_SECTIONS = ("TEXTPLAN", "TIEUP", "THREADING", "TREADLING", "WEAVING")
+
+# 设计名可逆编码标记。WIF 是逐行文本格式，名称中的 CR/LF（含 Python
+# splitlines 认可的全部行分隔符：NEL/ / /VT/FF/RS/GS/US 等）
+# 会破坏行结构；反斜杠与首尾空白也需要无损保留。含这些字符的名称导出为
+# 单行负载：
+#     Name=\B64:<crc32(utf-8 name) 的 8 位十六进制><urlsafe-base64(utf-8 name)>
+# 校验和用于识别被截断 / 改写的损坏负载；负载字符（[0-9A-FA-Za-z_-]=）
+# 不会与任何行分隔符冲突。旧版无标记的 Name= 文本按老规则（strip）解析，
+# 仍可导入。
+_NAME_ENC_PREFIX = "\\B64:"
+_NAME_CRC_LEN = 8
 
 
 class WifError(DesignError):
@@ -108,7 +122,8 @@ def parse_wif(text: str) -> dict:
             )
         sections[current][key] = value
 
-    # ---- [WIF]：版本必须为 1.1；Name 可缺省或为空 ----
+    # ---- [WIF]：版本必须为 1.1；Name 可缺省（无标记按旧规则 strip，
+    #      \B64: 标记按 Base64 无损解码；标记损坏抛 WifError → 400）----
     header = sections.get("WIF")
     if header is None:
         raise WifError("missing required section [WIF]")
@@ -117,7 +132,7 @@ def parse_wif(text: str) -> dict:
         raise WifError("[WIF] missing Version")
     if version != WIF_VERSION:
         raise WifError(f"unsupported WIF version {version!r}: only {WIF_VERSION} is supported")
-    name = header.get("NAME", "").strip() or None
+    name = _decode_name(header.get("NAME"))
 
     # ---- [CONTENTS]：必须逐一声明 TEXTPLAN/TIEUP/THREADING/TREADLING/WEAVING ----
     contents = sections.get("CONTENTS")
@@ -260,11 +275,68 @@ def _parse_index_map(
     return [values[i] for i in range(1, count + 1)]
 
 
-def _escape_name(name: str | None) -> str:
-    """设计名压成单行：CR/LF 会破坏逐行解析，统一替换为空格。"""
+def _name_needs_encoding(name: str) -> bool:
+    """名称是否含无法在无标记 Name= 行中无损表示的字符：Python splitlines
+    认可的任何行分隔符（CR/LF/NEL/U+2028/U+2029/VT/FF/…）、反斜杠，
+    或首尾空白（旧解析规则会 strip）。"""
+    if not name:
+        return False
+    if name.splitlines() != [name]:
+        return True
+    if "\\" in name or name != name.strip():
+        return True
+    return False
+
+
+def _encode_name(name: str | None) -> str:
+    """设计名编码为 WIF 单行 Name= 的值。普通名称原样输出；含行分隔符、
+    反斜杠或首尾空白的名称用 \\B64:<crc32><urlsafe-base64(utf-8)> 可逆
+    编码，保证导出再导入逐字符一致。None / 空串导出为空。"""
     if not name:
         return ""
-    return str(name).replace("\r", " ").replace("\n", " ").strip()
+    if not _name_needs_encoding(name):
+        return name
+    data = name.encode("utf-8")
+    crc = f"{zlib.crc32(data) & 0xFFFFFFFF:08x}"
+    payload = base64.urlsafe_b64encode(data).decode("ascii")
+    return _NAME_ENC_PREFIX + crc + payload
+
+
+def _decode_name(raw: str | None) -> str | None:
+    """解析 Name= 的值，与 _encode_name 配对：
+
+    * 缺省 / 空 / 仅空白 → None；
+    * \\B64: 标记 → 校验 CRC32 后严格 Base64 解码 UTF-8，任何损坏（负载过短、
+      校验和不符、CRC 非十六进制、非 Base64 字符、错误填充、非法 UTF-8、
+      标记被用于无需编码的名称）都抛 WifError（导入整体 400 且不写库）；
+    * 其余为旧版无标记文本：按旧规则 strip，空则 None（向后兼容）。
+    """
+    if raw is None:
+        return None
+    if not raw.startswith(_NAME_ENC_PREFIX):
+        return raw.strip() or None
+    body = raw[len(_NAME_ENC_PREFIX):]
+    if len(body) <= _NAME_CRC_LEN:
+        raise WifError(f"[WIF] Name has corrupt {_NAME_ENC_PREFIX!r} encoding")
+    crc_hex, payload = body[:_NAME_CRC_LEN], body[_NAME_CRC_LEN:]
+    try:
+        expect_crc = int(crc_hex, 16)
+        # validate=True：拒绝非字母表字符；altchars=_- 对应 urlsafe 变体
+        data = base64.b64decode(payload.encode("ascii"), altchars=b"-_", validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise WifError(f"[WIF] Name has corrupt {_NAME_ENC_PREFIX!r} encoding") from exc
+    if (zlib.crc32(data) & 0xFFFFFFFF) != expect_crc:
+        raise WifError(f"[WIF] Name has corrupt {_NAME_ENC_PREFIX!r} checksum")
+    try:
+        name = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise WifError(f"[WIF] Name has corrupt {_NAME_ENC_PREFIX!r} encoding") from exc
+    # 只接受本服务导出时本应加标记的名称，防止标记 / 数据被篡改后静默入库。
+    if not _name_needs_encoding(name):
+        raise WifError(
+            f"[WIF] Name {_NAME_ENC_PREFIX!r} marker used on a name that needs no encoding"
+        )
+    return name or None
 
 
 def serialize_wif(
@@ -282,7 +354,7 @@ def serialize_wif(
     lines: list[str] = [
         "[WIF]",
         f"Version={WIF_VERSION}",
-        f"Name={_escape_name(name)}",
+        f"Name={_encode_name(name)}",
         "",
         "[CONTENTS]",
         "TEXTPLAN=yes",
